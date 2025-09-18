@@ -1,0 +1,12 @@
+{
+  "name": "funnel-backend",
+  "version": "1.0.0",
+  "description": "Placeholder backend service",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {}
+}

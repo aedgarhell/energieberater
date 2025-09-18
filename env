@@ -1,0 +1,39 @@
+# Domains
+FRONTEND_HOST=funnel.example.com
+BACKEND_HOST=api.example.com
+N8N_HOST=flow.example.com
+MINIO_HOST=files.example.local   # Konsole intern oder per VPN
+ACME_EMAIL=admin@example.com
+REGISTRY=registry.example.com/project
+TAG=main
+
+# Postgres
+POSTGRES_DB=funnel
+POSTGRES_USER=funnel
+POSTGRES_PASSWORD=changeMe
+
+# MinIO / S3
+MINIO_ROOT_USER=accesskey
+MINIO_ROOT_PASSWORD=secretkey
+S3_BUCKET=funnel-prod
+
+# Mail / SMTP
+SMTP_HOST=smtp.example.com
+SMTP_USER=mailer
+SMTP_PASS=changeMe
+SMTP_PORT=587
+SMTP_SECURE=true
+
+# Security
+JWT_SECRET=changeMeLongRandom
+ENCRYPTION_KEY=32bytes_base64_or_hex
+RECAPTCHA_SECRET=...
+TURNSTILE_SECRET=...
+
+# App
+NODE_ENV=production
+BASE_URL=https://funnel.example.com
+
+# Traefik Dashboard Basic Auth
+# Generate with: echo $(htpasswd -nb user password) | sed -e s/\\$/\\$\\$/g
+TRAEFIK_USERS=user:$$apr1$$...

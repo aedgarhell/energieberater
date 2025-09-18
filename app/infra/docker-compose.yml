@@ -1,0 +1,274 @@
+version: "3.9"
+
+# This Docker Compose file sets up the entire application stack for the Lead Funnel.
+# It is designed to be production-ready, with considerations for security,
+# networking, healthchecks, and scalability.
+
+services:
+  # ====================================================================================
+  # PROXY: Traefik handles incoming traffic, SSL termination, and routing.
+  # ====================================================================================
+  proxy:
+    image: traefik:v3.0
+    container_name: proxy
+    command:
+      # --- Entrypoints ---
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      # --- Docker Provider ---
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false" # Explicitly enable services
+      # --- Let's Encrypt (ACME) ---
+      - "--certificatesresolvers.le.acme.httpchallenge=true"
+      - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=web"
+      - "--certificatesresolvers.le.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
+      # --- Traefik Dashboard (for monitoring) ---
+      - "--api.dashboard=true"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "traefik_acme:/letsencrypt"
+    networks:
+      - public
+      - internal
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      # --- Global HTTP to HTTPS Redirect ---
+      - "traefik.http.routers.http-catchall.rule=hostregexp(`{host:.+}`)"
+      - "traefik.http.routers.http-catchall.entrypoints=web"
+      - "traefik.http.routers.http-catchall.middlewares=redirect-to-https"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+      # --- Traefik Dashboard ---
+      - "traefik.enable=true"
+      - "traefik.http.routers.dashboard.rule=Host(`traefik.${FRONTEND_HOST}`)"
+      - "traefik.http.routers.dashboard.entrypoints=websecure"
+      - "traefik.http.routers.dashboard.tls.certresolver=le"
+      - "traefik.http.routers.dashboard.service=api@internal"
+      - "traefik.http.routers.dashboard.middlewares=auth"
+      # --- Basic Auth for Dashboard (generate user:pass with htpasswd) ---
+      # Example: echo $(htpasswd -nb user password) | sed -e s/\\$/\\$\\$/g
+      - "traefik.http.middlewares.auth.basicauth.users=${TRAEFIK_USERS}"
+      # --- Default Security Headers ---
+      - "traefik.http.middlewares.sec-headers.headers.framedeny=true"
+      - "traefik.http.middlewares.sec-headers.headers.sslredirect=true"
+      - "traefik.http.middlewares.sec-headers.headers.contenttypenosniff=true"
+
+  # ====================================================================================
+  # FRONTEND: The Next.js/Astro customer-facing application.
+  # ====================================================================================
+  frontend:
+    # In production, this would be: image: ${REGISTRY}/funnel-frontend:${TAG}
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    container_name: frontend
+    env_file: [../../.env]
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.frontend.rule=Host(`${FRONTEND_HOST}`)"
+      - "traefik.http.routers.frontend.entrypoints=websecure"
+      - "traefik.http.routers.frontend.tls.certresolver=le"
+      - "traefik.http.routers.frontend.middlewares=sec-headers@docker"
+    depends_on:
+      - backend
+    networks: [internal]
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    deploy:
+      resources:
+        limits: { cpus: '0.5', memory: '512M' }
+
+  # ====================================================================================
+  # BACKEND: The NestJS/FastAPI backend API.
+  # ====================================================================================
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: backend
+    env_file: [../../.env]
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      - S3_ENDPOINT=http://storage:9000
+      - S3_BUCKET=${S3_BUCKET}
+      - S3_ACCESS_KEY=${MINIO_ROOT_USER}
+      - S3_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+      - REDIS_URL=redis://queue:6379
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.api.rule=Host(`${BACKEND_HOST}`)"
+      - "traefik.http.routers.api.entrypoints=websecure"
+      - "traefik.http.routers.api.tls.certresolver=le"
+      - "traefik.http.routers.api.middlewares=sec-headers@docker"
+    depends_on:
+      db: { condition: service_healthy }
+      storage: { condition: service_healthy }
+      queue: { condition: service_healthy }
+    networks: [internal]
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/healthz"] # Placeholder path
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits: { cpus: '1', memory: '1G' }
+
+  # ====================================================================================
+  # N8N: Workflow automation engine.
+  # ====================================================================================
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    env_file: [../../.env]
+    environment:
+      - N8N_HOST=${N8N_HOST}
+      - N8N_PROTOCOL=https
+      - N8N_PORT=5678
+      - WEBHOOK_URL=https://${N8N_HOST}/
+      - GENERIC_TIMEZONE=Europe/Berlin
+      - EXECUTIONS_DATA_SAVE_ON_SUCCESS=none
+      - EXECUTIONS_DATA_SAVE_ON_ERROR=all
+      - QUEUE_BULL_REDIS_HOST=queue
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.n8n.rule=Host(`${N8N_HOST}`)"
+      - "traefik.http.routers.n8n.entrypoints=websecure"
+      - "traefik.http.routers.n8n.tls.certresolver=le"
+      - "traefik.http.routers.n8n.middlewares=sec-headers@docker"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      - queue
+      - backend
+    networks: [internal]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:5678/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits: { cpus: '1', memory: '1G' }
+
+  # ====================================================================================
+  # DATABASE: PostgreSQL for structured data.
+  # ====================================================================================
+  db:
+    image: postgres:16-alpine
+    container_name: db
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks: [internal]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: { cpus: '1', memory: '2G' }
+
+  # ====================================================================================
+  # STORAGE: MinIO for S3-compatible object storage.
+  # ====================================================================================
+  storage:
+    image: minio/minio:latest
+    container_name: storage
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - MC_HOST_local=http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@localhost:9000
+    volumes:
+      - minio_data:/data
+    labels:
+      - "traefik.enable=true"
+      # S3 API Endpoint
+      - "traefik.http.routers.minio-s3.rule=Host(`${MINIO_HOST}`)"
+      - "traefik.http.routers.minio-s3.entrypoints=websecure"
+      - "traefik.http.routers.minio-s3.tls.certresolver=le"
+      - "traefik.http.routers.minio-s3.service=minio-s3"
+      - "traefik.http.services.minio-s3.loadbalancer.server.port=9000"
+      # MinIO Admin Console
+      - "traefik.http.routers.minio-console.rule=Host(`console.${MINIO_HOST}`)"
+      - "traefik.http.routers.minio-console.entrypoints=websecure"
+      - "traefik.http.routers.minio-console.tls.certresolver=le"
+      - "traefik.http.routers.minio-console.service=minio-console"
+      - "traefik.http.services.minio-console.loadbalancer.server.port=9001"
+    networks: [internal]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits: { cpus: '0.5', memory: '1G' }
+
+  # ====================================================================================
+  # QUEUE: Redis for background jobs and caching.
+  # ====================================================================================
+  queue:
+    image: redis:7-alpine
+    container_name: queue
+    networks: [internal]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    volumes:
+      - redis_data:/data
+    deploy:
+      resources:
+        limits: { cpus: '0.2', memory: '256M' }
+
+  # ====================================================================================
+  # OCR: Service for processing uploaded documents.
+  # ====================================================================================
+  # ocr:
+  #   # This service is not exposed to the internet. It's called by n8n or a worker.
+  #   image: ghcr.io/ocrmypdf/ocrmypdf:latest
+  #   container_name: ocr
+  #   networks: [internal]
+  #   restart: on-failure
+  #   deploy:
+  #     resources:
+  #       limits: { cpus: '2', memory: '4G' } # OCR can be resource-intensive
+
+# ====================================================================================
+# NETWORKS: Define custom networks for security and organization.
+# ====================================================================================
+networks:
+  public: # For traffic from the outside world to the proxy
+    name: public_net
+  internal: # For communication between services
+    name: internal_net
+    internal: true
+
+# ====================================================================================
+# VOLUMES: Define persistent data volumes.
+# ====================================================================================
+volumes:
+  traefik_acme: { name: traefik_acme }
+  n8n_data: { name: n8n_data }
+  pg_data: { name: pg_data }
+  minio_data: { name: minio_data }
+  redis_data: { name: redis_data }
